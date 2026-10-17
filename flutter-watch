@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Interactive Flutter runner with event-driven, content-aware hot reload."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+
+class WatchError(Exception):
+    pass
+
+
+def jsonc(text):
+    # Match strings first so comment-like text inside strings stays untouched.
+    tokens = r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/'
+    text = re.sub(tokens, lambda m: m[0] if m[0].startswith('"') else ' ', text)
+    text = re.sub(r'"(?:\\.|[^"\\])*"|,(\s*[}\]])',
+                  lambda m: m[1] if m[1] is not None else m[0], text)
+    return json.loads(text)
+
+
+def is_flutter_project(path):
+    """Recognize the Flutter SDK dependency in conventional pubspec YAML.
+
+    Supports block and inline flutter dependency values without a YAML runtime.
+    Comments and unrelated sdk fields don't qualify.
+    """
+    pubspec = path / 'pubspec.yaml'
+    if not pubspec.is_file():
+        return False
+    in_dependencies = False
+    flutter_indent = None
+    for raw in pubspec.read_text().splitlines():
+        line = raw.split('#', 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            in_dependencies = line == 'dependencies:'
+            flutter_indent = None
+            continue
+        if not in_dependencies:
+            continue
+        if flutter_indent is not None and indent > flutter_indent:
+            if re.fullmatch(r'''sdk:\s*['"]?flutter['"]?''', line.strip()):
+                return True
+        else:
+            flutter_indent = None
+            match = re.fullmatch(r'''['"]?flutter['"]?:\s*(.*)''', line.strip())
+            if match:
+                if re.fullmatch(r'''\{\s*sdk:\s*['"]?flutter['"]?\s*,?\s*\}''', match[1]):
+                    return True
+                if not match[1]:
+                    flutter_indent = indent
+    return False
+
+
+def workspace(start):
+    start = start.resolve()
+    for path in (start, *start.parents):
+        if (path / 'pubspec.yaml').is_file():
+            # Don't escape a plain Dart package into an enclosing Flutter app.
+            if is_flutter_project(path):
+                return path
+            break
+    raise WatchError('Not a Flutter repository. Run flutter-watch inside a Flutter repository.')
+
+
+def inside(path, root):
+    return path == root or root in path.parents
+
+
+def has_symlink(path, root):
+    """Check every component, not just the final file/directory."""
+    while inside(path, root):
+        if path.is_symlink():
+            return True
+        if path == root:
+            break
+        path = path.parent
+    return False
+
+
+def watch_roots(cwd, paths, root):
+    roots = []
+    for value in paths or ['lib']:
+        path = Path(os.path.abspath(cwd / value))
+        if not inside(path.resolve(), root) or not inside(path, root):
+            raise WatchError(f'Watch paths must stay inside the current Flutter repository: {value}')
+        if has_symlink(path, root) or not path.is_dir():
+            raise WatchError(f'Watch paths must be existing directories without symlinks: {value}')
+        roots.append(path)
+    return roots
+
+
+def configurations(root):
+    path = root / '.vscode/launch.json'
+    if not path.exists():
+        return []
+    data = jsonc(path.read_text())
+    if not isinstance(data, dict) or not isinstance(data.get('configurations', []), list):
+        raise WatchError('launch.json must contain a configurations array.')
+    return [c for c in data.get('configurations', []) if isinstance(c, dict)
+            and c.get('type') == 'dart' and c.get('request') == 'launch']
+
+
+def select_config(configs, name):
+    if name:
+        matches = [c for c in configs if c.get('name') == name]
+        if len(matches) != 1:
+            raise WatchError(f'Expected one configuration named {name!r}; found {len(matches)}.')
+        return matches[0]
+    if len(configs) <= 1:
+        return configs[0] if configs else {}
+    if not sys.stdin.isatty():
+        raise WatchError('Multiple configurations available; use --config NAME or --list.')
+    for i, config in enumerate(configs, 1):
+        print(f'  {i}. {config.get("name", "(unnamed)")}')
+    try:
+        index = int(input('Configuration number: ')) - 1
+        if 0 <= index < len(configs):
+            return configs[index]
+    except (ValueError, EOFError):
+        pass
+    raise WatchError('Invalid configuration selection.')
+
+
+def expand(value, root):
+    if not isinstance(value, str):
+        raise WatchError('Configuration values must be strings.')
+
+    def variable(match):
+        key = match[1]
+        if key == 'workspaceFolder':
+            return str(root)
+        if key == 'workspaceFolderBasename':
+            return root.name
+        if key.startswith('env:') and key[4:] in os.environ:
+            return os.environ[key[4:]]
+        raise WatchError(f'Unsupported or unset variable: ${{{key}}}')
+
+    return re.sub(r'\$\{([^}]+)\}', variable, value)
+
+
+def launch_options(config, root, extra):
+    supported = {'name', 'type', 'request', 'program', 'cwd', 'env',
+                 'flutterMode', 'deviceId', 'toolArgs', 'args',
+                 'console', 'internalConsoleOptions', 'presentation'}
+    unsupported = set(config) - supported
+    if unsupported:
+        raise WatchError('Unsupported launch.json fields: ' + ', '.join(sorted(unsupported)))
+    cwd = Path(expand(config.get('cwd', str(root)), root))
+    if not cwd.is_absolute():
+        cwd = root / cwd
+    cwd = cwd.resolve()
+    if not inside(cwd, root):
+        raise WatchError('Configuration cwd must stay inside the current Flutter repository.')
+    if not is_flutter_project(cwd):
+        raise WatchError(f'Configuration cwd is not a Flutter project: {cwd}')
+    env = os.environ.copy()
+    values = config.get('env', {})
+    if not isinstance(values, dict):
+        raise WatchError('env must be an object.')
+    for key, value in values.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = expand(value, root)
+    args = []
+    mode = config.get('flutterMode', 'debug')
+    if mode != 'debug':
+        raise WatchError('flutter-watch requires debug mode for hot reload.')
+    if config.get('program'):
+        args += ['--target', expand(config['program'], root)]
+    if config.get('deviceId'):
+        args += ['--device-id', expand(config['deviceId'], root)]
+    for key in ('toolArgs', 'args'):
+        items = config.get(key, [])
+        if not isinstance(items, list):
+            raise WatchError(f'{key} must be an array of strings.')
+        for value in items:
+            value = expand(value, root)
+            args += [value] if key == 'toolArgs' else ['--dart-entrypoint-args=' + value]
+    args += extra
+    forbidden = {'--profile', '--release', '--jit-release', '--machine', '--no-hot',
+                 '--no-resident', '--trace-startup', '--benchmark', '--pid-file',
+                  '--use-application-binary', '--project-root', '--filesystem-root'}
+    if any(arg.split('=')[0] in forbidden for arg in args):
+        raise WatchError('Arguments must preserve interactive debug/hot mode and the managed PID file.')
+    return cwd, env, args
+
+
+class Contents:
+    def __init__(self, roots):
+        self.roots = roots
+        self.hashes = {}
+        self.update(roots)
+
+    def allowed(self, path):
+        return any(inside(path, root) and not has_symlink(path, root)
+                   and inside(path.resolve(), root) for root in self.roots)
+
+    def update(self, paths):
+        candidates = set()
+        for path in paths:
+            path = Path(os.path.abspath(path))
+            if not self.allowed(path):
+                continue
+            if path.is_dir():
+                for folder, dirs, files in os.walk(path, followlinks=False):
+                    dirs[:] = [name for name in dirs if not (Path(folder) / name).is_symlink()]
+                    candidates.update(Path(folder) / name for name in files
+                                      if name.endswith('.dart'))
+            elif path.suffix == '.dart':
+                candidates.add(path)
+            # Directory removal/rename: check cached descendants as well.
+            if path.suffix != '.dart' or path.is_dir():
+                candidates.update(p for p in self.hashes if path == p or path in p.parents)
+        changed = False
+        for path in candidates:
+            try:
+                if not self.allowed(path):
+                    digest = None
+                else:
+                    digest = hashlib.sha256(path.read_bytes()).digest()
+            except FileNotFoundError:
+                digest = None
+            # Other I/O errors propagate: never quietly accept unreadable content.
+            if self.hashes.get(path) != digest:
+                changed = True
+                if digest is None:
+                    self.hashes.pop(path, None)
+                else:
+                    self.hashes[path] = digest
+        return changed
+
+
+def event_paths(line):
+    data = json.loads(line)
+    events = data if isinstance(data, list) else [data]
+    return {Path(tag['absolute']) for event in events for tag in event.get('tags', [])
+            if tag.get('kind') == 'path' and 'absolute' in tag}
+
+
+def stop(process):
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def run(cwd, env, args, roots, debounce):
+    flutter = shutil.which('flutter', path=env.get('PATH'))
+    watcher = shutil.which('watchexec')
+    if not flutter:
+        raise WatchError('flutter is not on PATH.')
+    if not watcher:
+        raise WatchError('watchexec is not installed. On macOS: brew install watchexec')
+    contents = Contents(roots)
+    events = queue.Queue()
+    watching = app = None
+    with tempfile.TemporaryDirectory(prefix='flutter-watch-') as session:
+        pidfile = Path(session) / 'flutter.pid'
+        command = [watcher, '--only-emit-events', '--no-follow-symlinks',
+                   '--debounce', '50ms', '--no-discover-ignore']
+        for root in roots:
+            command += ['--watch', str(root)]
+        # Don't filter extensions here: directory moves must also reach the cache.
+        try:
+            watching = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, text=True,
+                                        start_new_session=True)
+
+            def read_events():
+                try:
+                    for line in watching.stdout:
+                        events.put(('paths', event_paths(line)))
+                except (ValueError, OSError) as error:
+                    events.put(('error', str(error)))
+                finally:
+                    events.put(('watch-exit', None))
+
+            threading.Thread(target=read_events, daemon=True).start()
+            app = subprocess.Popen([flutter, 'run', *args, '--pid-file', str(pidfile)],
+                                   cwd=cwd, env=env)
+
+            def wait_app():
+                events.put(('app-exit', app.wait()))
+
+            threading.Thread(target=wait_app, daemon=True).start()
+            print('[flutter-watch] Watching Dart content changes; r / R / q work normally.', flush=True)
+            pending = set(roots)  # Reconcile startup races once, not on every save.
+            deadline = time.monotonic() + debounce
+            dirty = False
+            while True:
+                timeout = max(0, deadline - time.monotonic()) if pending else (0.1 if dirty else None)
+                try:
+                    kind, value = events.get(timeout=timeout)
+                    if kind == 'app-exit':
+                        return value
+                    if kind in ('error', 'watch-exit'):
+                        raise WatchError(f'Watcher stopped unexpectedly: {value or "check watchexec version/output"}')
+                    pending.update(value)
+                    deadline = time.monotonic() + debounce
+                    continue
+                except queue.Empty:
+                    pass
+                if pending:
+                    dirty = contents.update(pending) or dirty
+                    pending.clear()
+                if dirty and app.poll() is None and pidfile.exists():
+                    try:
+                        pid = int(pidfile.read_text().strip())
+                    except (ValueError, FileNotFoundError):
+                        continue
+                    # Flutter's launcher execs its Dart process. Never signal a PID
+                    # other than our own live child, even if the file is corrupted.
+                    if pid != app.pid:
+                        raise WatchError('Flutter PID does not match the child launched by this command.')
+                    try:
+                        app.send_signal(signal.SIGUSR1)
+                    except ProcessLookupError:
+                        continue
+                    dirty = False
+        finally:
+            stop(watching)
+            stop(app)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, epilog=
+        'Extra Flutter options pass through, e.g. flutter-watch -d macos. '
+        'Use -- before Flutter options that conflict with wrapper options.')
+    parser.add_argument('--config', metavar='NAME')
+    parser.add_argument('--list', action='store_true', help='list launch configurations')
+    parser.add_argument('--watch', action='append', metavar='DIR', help='source directory relative to cwd; repeatable (default: lib)')
+    parser.add_argument('--debounce', type=int, default=200, metavar='MS')
+    parser.add_argument('--dry-run', action='store_true', help='print resolved command without launching')
+    options, extra = parser.parse_known_args(argv)
+    if extra[:1] == ['--']:
+        extra = extra[1:]
+    if os.name != 'posix':
+        raise WatchError('flutter-watch currently supports macOS and Linux only.')
+    if options.debounce < 1:
+        raise WatchError('--debounce must be positive.')
+    root = workspace(Path.cwd())
+    configs = configurations(root)
+    if options.list:
+        for config in configs:
+            print(config.get('name', '(unnamed)'))
+        if not configs:
+            print('No Dart launch configurations; defaults to flutter run.')
+        return 0
+    config = select_config(configs, options.config)
+    cwd, env, args = launch_options(config, root, extra)
+    roots = watch_roots(cwd, options.watch, root)
+    if options.dry_run:
+        print(json.dumps({'cwd': str(cwd), 'command': ['flutter', 'run', *args],
+                          'watch': [str(p) for p in roots]}, indent=2))
+        return 0
+    return run(cwd, env, args, roots, options.debounce / 1000)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (WatchError, OSError, ValueError) as error:
+        print(f'flutter-watch: {error}', file=sys.stderr)
+        sys.exit(1)
